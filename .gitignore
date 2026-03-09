@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# 루트 레벨 중복 파일 (selfdrive/ 에 정리됨)
+/tunes.py
+/interface.py
+/carcontroller.py
+/values.py
+/tunes_orig.py
+/interface_orig.py
+/carcontroller_orig.py
+/values_orig.py
+
+# OS
+.DS_Store
+Thumbs.db
