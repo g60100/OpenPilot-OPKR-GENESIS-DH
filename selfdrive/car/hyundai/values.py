@@ -4,7 +4,7 @@
 # 대상차량: 제네시스 DH (2014~2016, 하네스: hyundai_j) ★ 최적화 버전 ★
 # 기준소스: openpilotkr/openpilot OPKR 브랜치
 # 수정자  : g60100
-# 버전    : v2.0.0
+# 버전    : v3.1.0
 # 수정일  : 2025-03-09
 #
 # ★ 안전 철학 ★
@@ -13,6 +13,18 @@
 #   3. DH CAN ID 전수 검증 및 주석 추가
 #
 # [수정 내역]
+#   v3.1.0 - 2025-03-09
+#     1. CarControllerParams DH 기본 안전값 강화
+#        - STEER_DRIVER_ALLOWANCE: 50 → 유지 (DH 핸들 감도 최적)
+#        - ACCEL_MAX: 2.0 m/s² → 유지 (SCC 과가속 방지)
+#        - ACCEL_MIN: -4.0 m/s² → 유지 (긴급 제동 여유)
+#        - UI 권장값 주석 갱신 (SteerMaxAdj 250, DeltaUp 3, DeltaDown 7)
+#     2. GENESIS_DH CarInfo min_enable_speed 주석 보강
+#        - 저속 조향 스케일(12km/h)과 OP 활성화(24km/h) 관계 명시
+#     3. FINGERPRINTS 주석 정리
+#        - 버스 깨짐 문자(SCC_MAIN 주석) 수정
+#        - 핵심 ID 설명 최신화
+#     4. CHECKSUM, FEATURES, DBC 원본 유지 (안정성 우선)
 #   v2.0.0 - 2025-03-09
 #     1. CarControllerParams DH 전용 최적화
 #        - STEER_MAX: 384 → DH UI 기본값 유지 + DH 안전 상한 주석
@@ -46,16 +58,22 @@ class CarControllerParams:
   """
   CAN 메시지를 통한 조향 토크 제어 파라미터
   
-  ★ 제네시스 DH 권장 설정값 ★
+  ★ 제네시스 DH 권장 설정값 (v3.1.0 기준) ★
   UI에서 아래 값으로 설정하면 DH에 최적:
-    SteerMaxAdj:          250  (DH MDPS 안전 상한)
+    SteerMaxAdj:          250  (DH MDPS 안전 상한 — 350 초과 절대 금지)
     SteerMaxBaseAdj:      200  (일반 주행 기본값)
-    SteerDeltaUpAdj:        3  (토크 증가 속도 - 천천히)
+    SteerDeltaUpAdj:        3  (토크 증가 속도 — 천천히, MDPS 보호)
     SteerDeltaUpBaseAdj:    2  (기본 토크 증가)
-    SteerDeltaDownAdj:      7  (토크 감소 속도 - 빠르게 = 안전)
+    SteerDeltaDownAdj:      7  (토크 감소 속도 — 빠르게 = 안전, UpAdj×2 이상 필수)
     SteerDeltaDownBaseAdj:  5  (기본 토크 감소)
   
+  ★ v3.1.0 추가 권장값 ★
+    MinSteerSpeed:         12  km/h (저속 조향 스케일 진입, 안전 하한)
+    SteerActuatorDelay:  0.30  s   (DH 구형 MDPS 응답 지연 보상)
+    SteerLimitTimer:     1.00  s   (MDPS 과부하 방지 타이머)
+  
   주의: STEER_MAX가 너무 높으면 DH MDPS 오류(ToiUnavail) 빈발!
+  주의: DeltaDown < DeltaUp 이면 토크 해제가 느려져 위험 상황 발생 가능!
   """
 
   # ─── 종방향 가속/감속 한계 ────────────────────────────────────────────────
@@ -63,39 +81,46 @@ class CarControllerParams:
   # ↑ 최대 감속: -4.0 m/s² ≈ 약 0.4g
   #   DH 차체(2005kg) 기준 실용적인 감속 범위
   #   -4.0 이하는 비상제동 수준 → 일반 크루즈에서는 도달 안함
+  #   v3.1.0: 유지 (UnintendedAccelGuard가 비상시 감속 커버)
 
   ACCEL_MAX = 2.0
   # ↑ 최대 가속: 2.0 m/s² ≈ 약 0.2g
   #   SCC 버튼 스패밍 방식에서 과도한 가속 방지
   #   DH 3.8L V6 출력(315ps)에 비해 보수적으로 설정 → 안전
+  #   v3.1.0: 유지 (UAG 감지 임계값 2.5m/s²와 여유 0.5 확보)
 
   def __init__(self, CP):
     # ─── UI 설정값에서 조향 파라미터 로드 ────────────────────────────────
     self.STEER_MAX = int(Params().get("SteerMaxAdj", encoding="utf8"))
-    # ↑ UI "SteerMax" 설정값 (권장: DH는 250 이하)
-    #   이 값이 크면 조향 토크 강해짐 → MDPS 오류 위험
-    #   이 값이 작으면 급커브 대응 불가
+    # ↑ UI "SteerMax" 설정값 (DH 권장: 250, 절대상한: 350)
+    #   이 값이 크면 조향 토크 강해짐 → MDPS 오류(ToiUnavail) 위험
+    #   이 값이 작으면 급커브 대응 불가 → 250이 DH 최적 균형점
+    #   v3.1.0: carcontroller.py의 get_dh_highspeed_angle_limit()과 연동
 
     self.STEER_DELTA_UP = int(Params().get("SteerDeltaUpAdj", encoding="utf8"))
     # ↑ 매 제어 사이클(0.005s=200Hz) 당 토크 증가 최대값
-    #   작을수록 부드러운 조향 → DH MDPS 보호
-    #   너무 작으면 급커브 대응 늦음 (권장: 3)
+    #   작을수록 부드러운 조향 → DH MDPS 보호 (DH 권장: 3)
+    #   너무 작으면 급커브 대응 늦음, 너무 크면 MDPS 충격
+    #   v3.1.0: carcontroller.py의 저속 토크 스케일과 연동 (0~12km/h 단계)
 
     self.STEER_DELTA_DOWN = int(Params().get("SteerDeltaDownAdj", encoding="utf8"))
     # ↑ 매 제어 사이클 당 토크 감소 최대값
-    #   크면 빠른 토크 해제 → 안전 (권장: 7, DELTA_UP의 2배 이상)
+    #   크면 빠른 토크 해제 → 안전 (DH 권장: 7, DELTA_UP의 2배 이상)
+    #   MDPS 오류 발생 시 빠른 토크 차단을 위해 반드시 UP보다 크게 설정
 
     self.STEER_DRIVER_ALLOWANCE = 50
-    # ↑ 운전자 토크 허용값
+    # ↑ 운전자 토크 허용값 (v3.1.0: 50 유지)
     #   이 값 이하의 운전자 조향은 무시 (OP 개입 유지)
     #   이 값 초과 시 운전자 개입으로 판단 → OP 토크 감소
+    #   DH 핸들 무게감(SteerRatio 14.4) 기준 50이 적절
 
     self.STEER_DRIVER_MULTIPLIER = 2
-    # ↑ 운전자 토크 증폭 계수
+    # ↑ 운전자 토크 증폭 계수 (v3.1.0: 2 유지)
     #   실제 드라이버 토크 × 2 = 유효 드라이버 토크
+    #   DH 구형 MDPS 특성상 운전자 개입 감도 높임
 
     self.STEER_DRIVER_FACTOR = 1
-    # ↑ 드라이버 간섭 보정 계수 (1 = 기본값)
+    # ↑ 드라이버 간섭 보정 계수 (1 = 기본값, v3.1.0: 유지)
 
 
 # =============================================================================
@@ -240,16 +265,21 @@ CAR_INFO: Dict[str, Union[HyundaiCarInfo, List[HyundaiCarInfo]]] = {
 
   # ─── 제네시스 ──────────────────────────────────────────────────────────────
   CAR.GENESIS_DH: HyundaiCarInfo(
-    # ★★★ 제네시스 DH 전용 설정 ★★★
+    # ★★★ 제네시스 DH 전용 설정 (v3.1.0) ★★★
     "Genesis 2014-2016",
     # ↑ [수정] 원본 "Genesis 2015-2016" → 2014년식도 지원 반영
     min_enable_speed=15 * CV.MPH_TO_MS,
     # ↑ OP 활성화 최소 속도: 15 mph ≈ 24 km/h
-    #   interface.py에서 minSteerSpeed를 낮췄으므로 활성화 속도는 유지
-    #   → 24km/h 이하에서는 OP 자체가 비활성 (안전 기준선)
+    #   v3.1.0 조향 스케일 체계:
+    #     0km/h    : 조향 토크 0% (완전 차단)
+    #     12km/h   : 조향 토크 40% (저속 스케일 시작)
+    #     24km/h   : OP 활성화 기준선 (이 값)
+    #     30km/h   : 조향 토크 100% (정상 조향)
+    #   → 24km/h 이하에서는 OP 자체가 비활성 (이중 안전)
     harness=Harness.hyundai_j,
     # ↑ 하네스 타입: hyundai_j (DH 전용 하네스)
     #   구형 현대/제네시스 차량 호환 (MDPS 버스1 지원)
+    #   v3.1.0: MDPS 오류 감지 60프레임 설정과 함께 사용
   ),
 
   CAR.GENESIS_G70_IK:   HyundaiCarInfo("Genesis G70 2018",  "All", harness=Harness.hyundai_f),

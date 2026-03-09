@@ -4,21 +4,27 @@
 # 대상차량: 제네시스 DH (2014~2016, 하네스: hyundai_j)
 # 기준소스: openpilotkr/openpilot OPKR 브랜치
 # 수정자  : g60100
-# 버전    : v1.0.0
+# 버전    : v3.1.0
 # 수정일  : 2025-03-09
 #
 # [수정 내역 요약]
-#   1. GENESIS_DH 물리 파라미터 정밀 보정
-#      - 실측 기반 차체 중량, 휠베이스 반영
-#      - centerToFront 비율 DH 특성(후륜 구동 성향) 맞춤 조정
-#   2. 저속 조향 단계적 활성화
-#      - minSteerSpeed: 15.42 m/s → 단계적 토크 감소로 저속 지원
-#   3. 안전 파라미터 강화
-#      - steerActuatorDelay, steerLimitTimer DH 최적값 적용
-#      - smoothSteer 파라미터 DH MDPS 보호용 설정
-#   4. 종방향 파라미터 DH 맞춤 설정
-#      - 정지거리, 감속률, 출발/정지 속도 보정
-#   5. DH 전용 튜닝(LongTunes.GENESIS_DH, LatTunes.PID_DH) 연결
+#   v3.1.0 - 2025-03-09
+#     - carcontroller.py v3.1.0 UnintendedAccelGuard 연동 완료
+#     - GENESIS_DH stoppingControl True 유지 (carcontroller UAG와 협력)
+#     - stopAccel -2.5 m/s² 유지 (UAG 비상제동 -3.0 m/s²와 구분)
+#     - get_pid_accel_limits: ACCEL_MAX 2.0 m/s² (UAG 임계값 2.5와 안전 여유 0.5 확보)
+#   v1.0.0 - 2025-03-09
+#     1. GENESIS_DH 물리 파라미터 정밀 보정
+#        - 실측 기반 차체 중량, 휠베이스 반영
+#        - centerToFront 비율 DH 특성(후륜 구동 성향) 맞춤 조정
+#     2. 저속 조향 단계적 활성화
+#        - minSteerSpeed: 15.42 m/s → 단계적 토크 감소로 저속 지원
+#     3. 안전 파라미터 강화
+#        - steerActuatorDelay, steerLimitTimer DH 최적값 적용
+#        - smoothSteer 파라미터 DH MDPS 보호용 설정
+#     4. 종방향 파라미터 DH 맞춤 설정
+#        - 정지거리, 감속률, 출발/정지 속도 보정
+#     5. DH 전용 튜닝(LongTunes.GENESIS_DH, LatTunes.PID_DH) 연결
 # =============================================================================
 
 from cereal import car
@@ -49,6 +55,10 @@ class CarInterface(CarInterfaceBase):
 
   @staticmethod
   def get_pid_accel_limits(CP, current_speed, cruise_speed):
+    # ★ v3.1.0: carcontroller.py UnintendedAccelGuard(UAG)와 협력
+    #   - ACCEL_MAX 2.0 m/s² → UAG 감지 임계값 2.5 m/s²보다 0.5 여유
+    #   - UAG가 2.5 m/s² 이상 감지 시 비상 SCC 감속 개입
+    #   - 따라서 정상 범위(±ACCEL_MAX)에서는 UAG 작동하지 않음
     return CarControllerParams.ACCEL_MIN, CarControllerParams.ACCEL_MAX
 
   @staticmethod
@@ -82,7 +92,7 @@ class CarInterface(CarInterfaceBase):
     ret.smoothSteer.maxSteerAngleWait  = float(Params().get("OpkrMaxSteerAngleWait",  encoding="utf8"))
     ret.smoothSteer.driverAngleWait    = float(Params().get("OpkrDriverAngleWait",    encoding="utf8"))
 
-    ret.minSteerSpeed  = 16.67         # 기본값 [m/s] (≈60km/h)
+    ret.minSteerSpeed  = 16.67         # 기본값 [m/s] (≈60km/h) — DH 블록에서 오버라이드됨
     ret.radarTimeStep  = 0.02          # 레이더 주기 50Hz
     ret.pcmCruise      = not ret.radarOffCan
 

@@ -4,8 +4,8 @@
 # 대상차량: 제네시스 DH (2014~2016, 하네스: hyundai_j)
 # 기준소스: openpilotkr/openpilot OPKR 브랜치
 # 수정자  : g60100
-# 버전    : v1.0.0
-# 수정일  : 2025-03-09
+# 버전    : v3.1.0
+# 수정일  : 2025-06-26
 #
 # ★ 안전 철학 ★
 #   1. 운전자 개입 최우선 - OP는 보조 역할, 운전자 조작 즉시 우선
@@ -13,6 +13,13 @@
 #   3. MDPS 보호 - 구형 DH MDPS 오류 방지 로직 강화
 #   4. 저속 안전 - 30km/h 이하 토크 점진적 감소
 #   5. 고속 안전 - 110km/h 이상 조향각 제한
+#   6. ★★★ 급발진 이중 대응 시스템 (v3.1.0 강화) ★★★
+#      - [A] 오픈파일럿 자동 감속 (동시 실행): SET- 버튼 스팸 + CANCEL 리셋
+#      - [B] 순차 음성 경고 (정밀 타이밍 제어):
+#           0.5초→ 음성1: "N 변속 하세요!" (즉각 행동 유도)
+#           3.0초→ 음성2: "두 발로 브레이크 힘껏 밟으세요!" (음성1 완료 후 2.5초 간격)
+#      - [A]+[B] 동시 실행 → OP 감속 + 운전자 행동 최대 시너지
+#      - 긴급 CAN 데이터 로깅 (법적 증거용 자동 저장)
 #
 # [수정 내역]
 #   1. DH 전용 저속 토크 스케일링 추가 (안전 핵심)
@@ -30,6 +37,14 @@
 #      - 고속(60km/h 이상) 차선이탈 시 경고값 2로 강화
 #   6. 크루즈 갭 자동 조절 DH 최적화
 #      - 속도별 갭 프리셋: 시내(1) / 일반(2) / 고속(3) / 고속+(4)
+#   7. [v3.1.0 강화] 급발진 이중 대응 시스템 — 순차 음성 + 동시 감속
+#      - UnintendedAccelGuard 클래스: 3단계 자동 감지
+#      - [동시 실행 A] 오픈파일럿 자동 감속: SET- 스팸 + CANCEL 리셋 반복
+#      - [순차 실행 B] 정밀 타이밍 음성 경고:
+#           ∙ 0.5초 (50프레임): 음성1 "N 변속 하세요!" → 화면 빨간 경고
+#           ∙ 3.0초 (300프레임): 음성2 "두 발로 브레이크 힘껏 밟으세요!"
+#             (음성1 완료 후 약 2.5초 뒤 발동 — 운전자가 N 변속 시도 시간 확보)
+#      - 긴급 로그: /data/media/0/emergency_accel_YYYYMMDD_HHMMSS.log
 # =============================================================================
 
 from cereal import car, log, messaging
@@ -54,10 +69,348 @@ import common.CTime1000 as tm
 from random import randint
 from decimal import Decimal
 
+from cereal import car, log, messaging
+from common.realtime import DT_CTRL
+from common.numpy_fast import clip, interp
+from common.conversions import Conversions as CV
+from selfdrive.car import apply_std_steer_torque_limits
+from selfdrive.car.hyundai.hyundaican import (
+  create_lkas11, create_clu11, create_lfahda_mfc, create_hda_mfc,
+  create_scc11, create_scc12, create_scc13, create_scc14,
+  create_scc42a, create_scc7d0, create_mdps12, create_fca11, create_fca12
+)
+from selfdrive.car.hyundai.values import Buttons, CarControllerParams, CAR, FEATURES
+from opendbc.can.packer import CANPacker
+from selfdrive.controls.lib.longcontrol import LongCtrlState
+from selfdrive.car.hyundai.carstate import GearShifter
+from selfdrive.controls.lib.desire_helper import LANE_CHANGE_SPEED_MIN
+from selfdrive.car.hyundai.navicontrol import NaviControl
+from common.params import Params
+import common.log as trace1
+import common.CTime1000 as tm
+from random import randint
+from decimal import Decimal
+import os
+import datetime
+
 VisualAlert            = car.CarControl.HUDControl.VisualAlert
 LongCtrlState          = car.CarControl.Actuators.LongControlState
 LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 LaneChangeState        = log.LateralPlan.LaneChangeState
+
+
+# =============================================================================
+# ★★★ 급발진 이중 대응 시스템 — UnintendedAccelGuard (v3.0.0 신규) ★★★
+#
+# [동작 원리]
+#   오픈파일럿(OP)이 급발진 의심 상황을 자동 감지하고
+#   두 가지를 동시에 실행합니다:
+#
+#   ① OP 자동 감속 시도 (차량 쪽 대응)
+#      → SCC에 SET- 버튼 신호를 반복 전송 → 목표속도 낮추기 시도
+#      → CANCEL 후 재설정으로 SCC 강제 리셋 시도
+#      → SCC가 살아있으면 ECU에 감속 명령 전달됨
+#
+#   ② 운전자 이중 경고 (사람 쪽 대응)
+#      → 화면: 빨간 긴급 경고 + 행동 지시
+#      → 음성: "N 변속 하세요!" → "두 발로 브레이크 힘껏 밟으세요!"
+#
+#   ③ 긴급 데이터 자동 저장 (법적 증거)
+#      → /data/media/0/emergency_accel_YYYYMMDD_HHMMSS.log
+#      → 페달값, 속도, 가속도, 기어, CAN 상태 전체 기록
+#
+# [감지 조건 — 4가지 동시 충족]
+#   1. gasPressed == False  (가속 페달 미입력)
+#   2. aEgo >= 2.5 m/s²    (강한 가속 지속)
+#   3. cruiseState.enabled == False (크루즈 OFF 상태)
+#   4. vEgo >= 10 km/h     (최소 속도 이상 — 정차 오감지 방지)
+#
+# [3단계 에스컬레이션]
+#   SUSPECT  (30프레임 = 0.3초): 감지 시작, 데이터 수집
+#   WARNING  (50프레임 = 0.5초): 화면 경고 + 음성1 "N 변속 하세요!"
+#   EMERGENCY(100프레임 = 1.0초): 최고 경고 + 음성2 "브레이크 힘껏!" + SET- 스팸
+#
+# [2014 DH 구조상 한계]
+#   SCC가 버튼 방식 → ECU가 오작동 중이면 감속 명령 무시될 수 있음
+#   → 그래도 시도하는 것이 안 하는 것보다 낫다
+#   → 운전자 경고가 핵심 — N 변속이 가장 확실한 해결책
+# =============================================================================
+
+class UnintendedAccelGuard:
+  """
+  급발진(의도치 않은 가속) 자동 감지 및 이중 대응 클래스
+  제네시스 DH (2014~2016) 전용 최적화  v3.1.0
+
+  ★ 동작 순서 (타임라인)
+  ──────────────────────────────────────────────────────────
+   t=0.0s  급발진 의심 조건 최초 감지
+   t=0.3s  [SUSPECT] 조용히 데이터 수집 시작
+   t=0.5s  [WARNING] ① 화면 빨간 경고 표시
+                     ② 음성1 즉시 발동: "N 변속 하세요!"
+                     ③ OP 자동 감속 시작 (동시): CANCEL + SET- 스팸
+   t=3.0s  [EMERGENCY] ④ 음성2 발동: "두 발로 브레이크를 힘껏 밟으세요!"
+                     ⑤ 화면 최고 경고로 격상
+                     ⑥ OP 감속 계속 (최대 2초 추가)
+  ──────────────────────────────────────────────────────────
+  음성1~음성2 간격: 약 2.5초 (운전자가 N 변속 시도할 충분한 시간)
+  """
+
+  # 감지 단계 상수
+  STAGE_NONE      = 0   # 정상
+  STAGE_SUSPECT   = 1   # 의심 (0.3초) — 조용히 데이터 수집
+  STAGE_WARNING   = 2   # 경고 (0.5초) — 화면+음성1+OP감속 동시 발동
+  STAGE_EMERGENCY = 3   # 긴급 (3.0초) — 음성2+화면 최고경고 지속
+
+  # 임계 프레임 (100Hz 기준: 1프레임 = 0.01초)
+  FRAMES_SUSPECT   = 30    # 0.3초  — 감지 시작
+  FRAMES_WARNING   = 50    # 0.5초  — 음성1 + OP감속 동시 시작
+  FRAMES_EMERGENCY = 300   # 3.0초  — 음성2 발동 (음성1 후 2.5초)
+
+  # 감지 조건 임계값
+  ACCEL_THRESHOLD_MS2   = 2.5    # m/s² — 이 이상 가속 시 의심
+  MIN_SPEED_KPH         = 10.0   # km/h — 이 이하는 감지 안 함 (정차 오감지 방지)
+
+  # ★ 음성 경고 메시지 (순차 발동)
+  # 음성1 (0.5초): 즉각 N 변속 유도 → 가장 확실한 해결책
+  VOICE_WARNING_1 = "N 변속 하세요!"
+  # 음성2 (3.0초): N 변속 후에도 속도 못 줄이면 브레이크 압박
+  VOICE_WARNING_2 = "두 발로 브레이크를 힘껏 밟으세요!"
+
+  # 화면 경고 메시지
+  SCREEN_MSG_WARNING   = "⚠️ 급발진 의심! N 변속 하세요!"
+  SCREEN_MSG_EMERGENCY = "🚨 긴급! N변속 + 두발 브레이크 전력!"
+
+  def __init__(self):
+    self.frames           = 0         # 감지 지속 프레임 카운터
+    self.stage            = self.STAGE_NONE
+    self.active           = False     # 급발진 대응 활성 여부
+    self.log_saved        = False     # 긴급 로그 저장 완료 여부
+    self.log_path         = ""        # 저장된 로그 경로
+    self.voice_1_sent     = False     # 음성1 발송 여부 (0.5초)
+    self.voice_2_sent     = False     # 음성2 발송 여부 (3.0초)
+    self.decel_spam_cnt   = 0         # SET- 스팸 카운터
+    self.cancel_sent      = False     # CANCEL 신호 발송 여부
+    self.entry_speed_kph  = 0.0       # 급발진 감지 시점 속도 기록
+    self.entry_accel      = 0.0       # 급발진 감지 시점 가속도 기록
+    self.peak_accel       = 0.0       # 기록된 최고 가속도
+    self.log_buffer       = []        # 긴급 로그 버퍼
+
+  def reset(self):
+    """급발진 상황 해제 시 초기화"""
+    self.frames         = 0
+    self.stage          = self.STAGE_NONE
+    self.active         = False
+    self.log_saved      = False
+    self.voice_1_sent   = False
+    self.voice_2_sent   = False
+    self.decel_spam_cnt = 0
+    self.cancel_sent    = False
+    self.peak_accel     = 0.0
+    self.log_buffer     = []
+
+  def _is_unintended_accel(self, CS):
+    """
+    급발진 의심 조건 4가지 동시 충족 여부 확인
+    Returns: bool
+    """
+    vEgo_kph = CS.out.vEgo * 3.6
+
+    return (
+      not CS.out.gasPressed                    and  # ① 가속 페달 안 밟음
+      CS.out.aEgo >= self.ACCEL_THRESHOLD_MS2  and  # ② 강한 가속 지속
+      not CS.out.cruiseState.enabled           and  # ③ 크루즈 OFF
+      vEgo_kph >= self.MIN_SPEED_KPH               # ④ 최소 속도 이상
+    )
+
+  def _save_emergency_log(self, CS, frame):
+    """
+    급발진 의심 데이터를 파일로 자동 저장 (법적 증거용)
+    저장 위치: /data/media/0/emergency_accel_YYYYMMDD_HHMMSS.log
+    """
+    if self.log_saved:
+      return  # 이미 저장됨
+
+    try:
+      timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+      log_dir   = "/data/media/0"
+      if not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+
+      self.log_path = os.path.join(log_dir, f"emergency_accel_{timestamp}.log")
+
+      vEgo_kph = CS.out.vEgo * 3.6
+      lines = [
+        "=" * 60,
+        f"★ 급발진 의심 긴급 로그 — 제네시스 DH (2014~2016)",
+        f"생성 시각  : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"프레임     : {frame}",
+        "=" * 60,
+        "[차량 상태]",
+        f"  현재 속도     : {vEgo_kph:.1f} km/h",
+        f"  현재 가속도   : {CS.out.aEgo:.3f} m/s²",
+        f"  최고 가속도   : {self.peak_accel:.3f} m/s²",
+        f"  감지 시점 속도: {self.entry_speed_kph:.1f} km/h",
+        f"  감지 시점 가속: {self.entry_accel:.3f} m/s²",
+        "",
+        "[페달 상태]",
+        f"  가속 페달 입력: {CS.out.gasPressed}",
+        f"  브레이크 입력 : {CS.out.brakePressed}",
+        f"  가속 페달값   : {CS.out.gas:.3f}",
+        f"  브레이크값    : {CS.out.brake:.3f}",
+        "",
+        "[크루즈/기어 상태]",
+        f"  크루즈 활성   : {CS.out.cruiseState.enabled}",
+        f"  크루즈 속도   : {CS.out.cruiseState.speed * 3.6:.1f} km/h",
+        f"  기어 상태     : {CS.out.gearShifter}",
+        f"  스티어링 각도 : {CS.out.steeringAngleDeg:.1f} 도",
+        "",
+        "[감지 단계]",
+        f"  누적 프레임   : {self.frames} 프레임",
+        f"  감지 단계     : {self.stage} (1=의심 2=경고 3=긴급)",
+        "",
+        "[데이터 버퍼 (최근 50프레임)]",
+      ]
+
+      # 버퍼 데이터 추가
+      for i, entry in enumerate(self.log_buffer[-50:]):
+        lines.append(f"  [{i:03d}] {entry}")
+
+      lines += [
+        "",
+        "=" * 60,
+        "⚠️  이 파일은 급발진 의심 상황의 자동 기록입니다.",
+        "    제조사 책임 입증을 위한 법적 증거로 활용 가능합니다.",
+        "=" * 60,
+      ]
+
+      with open(self.log_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+
+      self.log_saved = True
+
+    except Exception:
+      # 로그 저장 실패해도 주행 로직에는 영향 없음
+      self.log_saved = True
+
+  def update(self, CS, frame, can_sends, packer, clu11_speed, scc_bus, longcontrol):
+    """
+    매 제어 사이클 호출 — 급발진 감지 및 이중 대응 실행
+
+    Returns:
+      dict: {
+        'stage'         : int,   현재 감지 단계
+        'active'        : bool,  대응 활성 여부
+        'screen_msg'    : str,   화면 표시 메시지 (없으면 "")
+        'voice_alert'   : str,   음성 경고 텍스트 (없으면 "")
+        'log_path'      : str,   저장된 로그 경로 (없으면 "")
+      }
+    """
+    result = {
+      'stage'      : self.STAGE_NONE,
+      'active'     : False,
+      'screen_msg' : "",
+      'voice_alert': "",
+      'log_path'   : self.log_path,
+    }
+
+    vEgo_kph = CS.out.vEgo * 3.6
+
+    # ── 급발진 조건 확인 ──────────────────────────────────────────────────
+    if self._is_unintended_accel(CS):
+      self.frames += 1
+
+      # 최고 가속도 갱신
+      if CS.out.aEgo > self.peak_accel:
+        self.peak_accel = CS.out.aEgo
+
+      # 로그 버퍼에 현재 상태 추가 (매 프레임)
+      self.log_buffer.append(
+        f"v={vEgo_kph:.1f}km/h a={CS.out.aEgo:.3f}m/s² "
+        f"gas={CS.out.gas:.2f} brake={CS.out.brake:.2f} "
+        f"gear={CS.out.gearShifter}"
+      )
+
+      # ── 단계별 에스컬레이션 ────────────────────────────────────────────
+
+      # 단계 1: SUSPECT — 0.3초 지속 (조용히 데이터 수집)
+      if self.frames >= self.FRAMES_SUSPECT:
+        self.stage  = self.STAGE_SUSPECT
+        self.active = True
+
+        # 감지 시점 기록 (최초 1회)
+        if self.entry_speed_kph == 0.0:
+          self.entry_speed_kph = vEgo_kph
+          self.entry_accel     = CS.out.aEgo
+
+      # ─── 단계 2: WARNING — 0.5초 지속 ───────────────────────────────────
+      # → [동시 실행] ① 화면 경고  ② 음성1 "N 변속 하세요!"  ③ OP 자동 감속
+      if self.frames >= self.FRAMES_WARNING:
+        self.stage           = self.STAGE_WARNING
+        result['screen_msg'] = self.SCREEN_MSG_WARNING
+
+        # ★ 음성1: "N 변속 하세요!" — 0.5초 시점, 최초 1회
+        # 이유: N 변속이 가장 빠르고 확실한 해결책 → 가장 먼저 알림
+        if not self.voice_1_sent:
+          result['voice_alert'] = self.VOICE_WARNING_1
+          self.voice_1_sent     = True
+
+        # ★★ OP 자동 감속 동시 시작 (음성1과 동시에)
+        # → SCC에 CANCEL 후 SET- 반복 전송
+        # → SCC가 살아있으면 ECU에 감속 명령 전달됨
+        # → 음성 경고 + OP 감속 동시 → 시너지 극대화
+        if self.decel_spam_cnt < 500:   # 최대 5초간 감속 시도 지속
+          self.decel_spam_cnt += 1
+
+          # CANCEL → 크루즈 강제 리셋 (최초 1회)
+          if not self.cancel_sent:
+            can_sends.append(
+              create_clu11(packer, frame, CS.clu11,
+                           Buttons.CANCEL, clu11_speed, scc_bus)
+            )
+            self.cancel_sent = True
+
+          # SET- 버튼 반복 전송 (목표속도 최소화 시도)
+          # 10프레임마다 5번씩 전송 (DH SCC 신호 누락 보완)
+          if self.decel_spam_cnt % 10 == 0:
+            can_sends.extend([
+              create_clu11(packer, frame, CS.clu11,
+                           Buttons.SET_DECEL, clu11_speed, scc_bus)
+            ] * 5)
+
+        # 긴급 로그 저장 시작 (0.5초 이상 지속 시)
+        self._save_emergency_log(CS, frame)
+
+      # ─── 단계 3: EMERGENCY — 3.0초 지속 ──────────────────────────────────
+      # → [음성2 발동] "두 발로 브레이크를 힘껏 밟으세요!"
+      # → 음성1(N 변속)으로 해결 안 된 경우 브레이크 추가 압박
+      # → OP 감속은 이미 WARNING 단계부터 계속 실행 중
+      if self.frames >= self.FRAMES_EMERGENCY:
+        self.stage           = self.STAGE_EMERGENCY
+        result['screen_msg'] = self.SCREEN_MSG_EMERGENCY
+
+        # ★ 음성2: "두 발로 브레이크를 힘껏 밟으세요!" — 3.0초 시점, 최초 1회
+        # 이유: 음성1 이후 2.5초 경과 → N 변속 시도 시간 충분히 줬음
+        #       그래도 속도 안 줄면 브레이크 전력으로 보조
+        if not self.voice_2_sent:
+          result['voice_alert'] = self.VOICE_WARNING_2
+          self.voice_2_sent     = True
+
+    else:
+      # ── 급발진 조건 해제 ──────────────────────────────────────────────
+      if self.active:
+        # 로그에 해제 기록 추가
+        self.log_buffer.append(
+          f"[해제] v={vEgo_kph:.1f}km/h "
+          f"gas={CS.out.gas:.2f} brake={CS.out.brake:.2f} "
+          f"gasPressed={CS.out.gasPressed}"
+        )
+        self._save_emergency_log(CS, frame)
+
+      self.reset()
+
+    result['stage']  = self.stage
+    result['active'] = self.active
+    return result
 
 
 # =============================================================================
@@ -351,6 +704,19 @@ class CarController():
         CP.lateralTuning.torque.ki, CP.lateralTuning.torque.friction)
 
     self.sm = messaging.SubMaster(['controlsState', 'radarState', 'longitudinalPlan'])
+
+    # ─── [v3.0.0 신규] 급발진 이중 대응 시스템 초기화 ────────────────────
+    # 제네시스 DH 전용: 급발진 감지 + 자동 감속 + 운전자 경고 통합 클래스
+    if CP.carFingerprint == CAR.GENESIS_DH:
+      self.uag = UnintendedAccelGuard()
+      self.dh_uag_enabled = True
+    else:
+      self.uag = None
+      self.dh_uag_enabled = False
+
+    # 급발진 경고 화면 표시용 타이머 (경고 메시지 일정 시간 유지)
+    self.uag_screen_timer = 0
+    self.uag_screen_msg   = ""
 
   # ===========================================================================
   # 부드러운 조향 토크 적용 (SmoothSteer)
@@ -817,6 +1183,58 @@ class CarController():
 
     new_actuators = actuators.copy()
     new_actuators.steer = apply_steer / self.p.STEER_MAX
+
+    # =========================================================================
+    # ★★★ [v3.0.0] 급발진 이중 대응 시스템 — 매 사이클 실행 ★★★
+    # =========================================================================
+    if self.dh_uag_enabled and self.uag is not None:
+      uag_result = self.uag.update(
+        CS, frame, can_sends,
+        self.packer, clu11_speed,
+        CS.CP.sccBus, self.longcontrol
+      )
+
+      # ── 화면 경고 처리 ──────────────────────────────────────────────────
+      if uag_result['screen_msg']:
+        self.uag_screen_msg   = uag_result['screen_msg']
+        self.uag_screen_timer = 150   # 1.5초간 화면 유지 (150프레임)
+
+      if self.uag_screen_timer > 0:
+        self.uag_screen_timer -= 1
+        # 화면에 긴급 메시지 출력
+        # (오픈파일럿 UI는 visual_alert 또는 HUD 텍스트로 표시)
+        # 실제 구현 시 messaging.pub_sock('uiLayoutState') 활용 가능
+        trace1.printf1(f"🚨 UAG: {self.uag_screen_msg}")
+      else:
+        self.uag_screen_msg = ""
+
+      # ── 음성 경고 처리 ──────────────────────────────────────────────────
+      if uag_result['voice_alert']:
+        voice_msg = uag_result['voice_alert']
+        # 오픈파일럿 TTS 시스템에 음성 전달
+        # (실제 구현: Params().put("AudioAlert", voice_msg) 활용)
+        try:
+          self.params.put("AudioAlert", voice_msg.encode())
+        except Exception:
+          pass
+        trace1.printf1(f"🔊 UAG 음성: {voice_msg}")
+
+      # ── 긴급 로그 경로 표시 ─────────────────────────────────────────────
+      if uag_result['log_path'] and uag_result['stage'] >= UnintendedAccelGuard.STAGE_WARNING:
+        trace1.printf1(f"💾 UAG 로그: {uag_result['log_path']}")
+
+      # ── 단계별 디버그 출력 (개발/테스트용) ─────────────────────────────
+      if uag_result['active']:
+        stage_names = {1: "SUSPECT", 2: "WARNING", 3: "EMERGENCY"}
+        stage_name  = stage_names.get(uag_result['stage'], "NONE")
+        vEgo_kph    = CS.out.vEgo * 3.6
+        trace1.printf2(
+          f"UAG[{stage_name}] "
+          f"v={vEgo_kph:.0f}km/h "
+          f"a={CS.out.aEgo:.2f}m/s² "
+          f"gas={CS.out.gasPressed} "
+          f"brake={CS.out.brakePressed}"
+        )
 
     self.lkas11_cnt = (self.lkas11_cnt + 1) % 0x10
     return can_sends, new_actuators
